@@ -495,7 +495,7 @@ struct WorkspaceManifest {
 }
 
 fn hash_text(s: &str) -> u64 {
-    mix_hash(NIL_HASH, str_hash(s.replace("\r\n", "\n").as_bytes()))
+    str_hash(s.replace("\r\n", "\n").as_bytes())
 }
 
 fn hash_text_file(path: &Path) -> u64 {
@@ -532,7 +532,7 @@ fn parse_workspace_manifest() -> WorkspaceManifest {
     assert!(
         read_trace_file(
             "build/workspace-manifest.trace".as_ref(),
-            hash_text_file("lakefile.lean".as_ref())
+            mix_hash(NIL_HASH, hash_text_file("lakefile.lean".as_ref()))
         ),
         "workspace-manifest hash does not match, run 'lake-ext'"
     );
@@ -749,7 +749,7 @@ impl<'a> Hasher<'a> {
             let arg_trace = lib.lean_args_trace();
             let mod_trace = mix_hash(
                 self.lean_trace,
-                mix_hash(arg_trace, mix_hash(src_hash, dep_trace)),
+                mix_hash(arg_trace, mix_hash(mix_hash(NIL_HASH, src_hash), dep_trace)),
             );
             let trace = read_trace_file(&mod_.to_path(&pkg.config.olean_dir, "trace"), mod_trace);
             trace.then_some(dep_trace)
@@ -832,7 +832,7 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
         files_to_download.collect()
     } else {
         files_to_download
-            .filter(|&hash| ltar_path(&cache_dir, hash).exists())
+            .filter(|&hash| !ltar_path(&cache_dir, hash).exists())
             .collect()
     };
     if files_to_download.is_empty() {
