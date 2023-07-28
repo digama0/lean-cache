@@ -48,6 +48,7 @@ def main : IO Unit := do
   let config ← MonadError.runEIO <| mkLoadConfig.{0} { leanInstall?, lakeInstall? }
   let ws ← MonadError.runEIO <| (loadWorkspace config).run (.eio .normal)
   let trace ← computeHash (TextFilePath.mk config.configFile)
+  IO.FS.createDirAll ws.root.buildDir
   let traceFile := ws.root.buildDir / "workspace-manifest.trace"
   IO.FS.writeFile traceFile trace.toString
   let jsonFile := ws.root.buildDir / "workspace-manifest.json"
