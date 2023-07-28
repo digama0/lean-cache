@@ -11,7 +11,7 @@ elab "current_lake" : term <= ty => do
 require Lake from current_lake
 
 @[default_target]
-lean_exe «lake_ext» where
+lean_exe «lake-ext» where
   buildType := .debug
   root := `Main
   supportInterpreter := true
