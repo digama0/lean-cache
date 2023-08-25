@@ -1,3 +1,6 @@
+use crossbeam_channel::TryRecvError;
+use curl::easy::Easy2;
+use curl::multi::{Easy2Handle, Multi};
 // #![allow(unused)]
 use leangz::lgz::{mix_hash, str_hash, NAME_ANON_HASH as NIL_HASH};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
@@ -5,9 +8,9 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::str::Chars;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -24,10 +27,8 @@ use std::time::{Duration, Instant};
 //         name: String,
 //         url: String,
 //         rev: String,
-//         #[serde(rename = "inputRev?")]
 //         input_rev: Option<String>,
-//         #[serde(rename = "subDir?")]
-//         subdir: Option<PathBuf>,
+//         sub_dir: Option<PathBuf>,
 //     },
 // }
 
@@ -307,9 +308,9 @@ fn parse_imports(s: &str) -> Vec<(Name, bool)> {
 //             PackageEntry::Path { name, dir } => {
 //                 deps.insert(name, dir);
 //             }
-//             PackageEntry::Git { name, subdir, .. } => {
+//             PackageEntry::Git { name, sub_dir, .. } => {
 //                 let mut path = rel_pkgs_dir.join(&name);
-//                 if let Some(dir) = subdir {
+//                 if let Some(dir) = sub_dir {
 //                     path.push(dir)
 //                 }
 //                 deps.insert(name, path);
@@ -358,19 +359,17 @@ struct PackageConfig {
     // more_server_args: Vec<String>,
     src_dir: PathBuf,
     build_dir: PathBuf,
-    #[serde(rename = "oleanDir")]
-    rel_olean_dir: PathBuf,
+    #[serde(rename = "leanLibDir")]
+    rel_lean_lib_dir: PathBuf,
     #[serde(skip)]
-    olean_dir: PathBuf,
-    #[serde(rename = "irDir")]
-    rel_ir_dir: PathBuf,
+    lean_lib_dir: PathBuf,
+    #[serde(rename = "nativeLibDir")]
+    rel_native_lib_dir: PathBuf,
     #[serde(skip)]
-    ir_dir: PathBuf,
-    // lib_dir: PathBuf,
+    native_lib_dir: PathBuf,
     // bin_dir: PathBuf,
-    // #[serde(rename = "releaseRepo?")]
+    // ir_dir: PathBuf,
     // release_repo: Option<String>,
-    // #[serde(rename = "buildArchive?")]
     // build_archive: Option<String>,
     // prefer_release_build: bool,
     #[serde(skip)]
@@ -416,6 +415,7 @@ struct LeanLibConfig {
     roots: Vec<Name>,
     globs: Vec<Glob>,
     // lib_name: String,
+    // extra_dep_targets: Vec<Name>,
     precompile_modules: bool,
     // default_facets: Vec<String>,
     // native_facets: Vec<String>,
@@ -429,8 +429,10 @@ struct LeanExeConfig {
     #[serde(flatten)]
     lean: LeanConfig,
     // name: String,
+    src_dir: PathBuf,
     root: Name,
     // exe_name: String,
+    // extra_dep_targets: Vec<Name>,
     // support_interpreter: bool,
     #[serde(skip)]
     lean_args_trace: u64,
@@ -441,9 +443,7 @@ struct LeanExeConfig {
 struct PackageManifest {
     dir: PathBuf,
     config: PackageConfig,
-    // #[serde(rename = "remoteUrl?")]
     // remote_url: Option<String>,
-    // #[serde(rename = "gitTag?")]
     // git_tag: Option<String>,
     // deps: Vec<Dependency>,
     lean_lib_configs: BTreeMap<String, LeanLibConfig>,
@@ -546,8 +546,8 @@ fn parse_workspace_manifest() -> WorkspaceManifest {
     for pkg in &mut manifest.packages {
         pkg.config.src_dir = pkg.dir.join(&pkg.config.src_dir);
         pkg.config.build_dir = pkg.dir.join(&pkg.config.build_dir);
-        pkg.config.olean_dir = pkg.config.build_dir.join(&pkg.config.rel_olean_dir);
-        pkg.config.ir_dir = pkg.config.build_dir.join(&pkg.config.rel_ir_dir);
+        pkg.config.lean_lib_dir = pkg.config.build_dir.join(&pkg.config.rel_lean_lib_dir);
+        pkg.config.native_lib_dir = pkg.config.build_dir.join(&pkg.config.rel_native_lib_dir);
         let mut trace = NIL_HASH;
         for arg in &pkg.config.lean.more_lean_args {
             trace = mix_hash(trace, mix_hash(NIL_HASH, str_hash(arg.as_bytes())))
@@ -567,6 +567,7 @@ fn parse_workspace_manifest() -> WorkspaceManifest {
                 trace = mix_hash(trace, mix_hash(NIL_HASH, str_hash(arg.as_bytes())))
             }
             exe.lean_args_trace = trace;
+            exe.src_dir = pkg.config.src_dir.join(&exe.src_dir);
         }
     }
     manifest
@@ -669,17 +670,17 @@ fn hash_as_lean(name: &Name) -> u64 {
     mix_hash(inner(p), str_hash(format!("{last}.lean").as_bytes()))
 }
 
-struct Hasher<'a> {
+struct Hasher<'a, F> {
     ws: &'a WorkspaceManifest,
     root_hash: u64,
     lean_trace: u64,
     invalidate_all: bool,
     cache: HashMap<Name, (Option<u64>, Option<u64>)>,
-    to_unpack: Vec<(Name, &'a PackageConfig, u64)>,
+    unpack: F,
 }
 
-impl<'a> Hasher<'a> {
-    fn new(ws: &'a WorkspaceManifest, invalidate_all: bool) -> Self {
+impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
+    fn new(ws: &'a WorkspaceManifest, invalidate_all: bool, unpack: F) -> Self {
         let mathlib_name = "mathlib";
         let mathlib = (ws.packages.iter())
             .find(|pkg| pkg.config.name == mathlib_name)
@@ -694,7 +695,7 @@ impl<'a> Hasher<'a> {
             lean_trace: mix_hash(NIL_HASH, str_hash(ws.lake_env.lean.githash.as_bytes())),
             invalidate_all,
             cache: HashMap::new(),
-            to_unpack: vec![],
+            unpack,
         }
     }
 
@@ -751,17 +752,22 @@ impl<'a> Hasher<'a> {
                 self.lean_trace,
                 mix_hash(arg_trace, mix_hash(mix_hash(NIL_HASH, src_hash), dep_trace)),
             );
-            let trace = read_trace_file(&mod_.to_path(&pkg.config.olean_dir, "trace"), mod_trace);
+            let trace =
+                read_trace_file(&mod_.to_path(&pkg.config.lean_lib_dir, "trace"), mod_trace);
             trace.then_some(dep_trace)
         });
         if trace.is_none() {
-            self.to_unpack.push((mod_.clone(), &pkg.config, hash))
+            (self.unpack)(mod_.clone(), &pkg.config, hash)
         }
         trace = trace.map(|dep_trace| {
-            let olean_hash =
-                hash_bin_file_cached(&mod_.to_path(&pkg.config.olean_dir, "olean"), "olean.trace");
-            let ilean_hash =
-                hash_bin_file_cached(&mod_.to_path(&pkg.config.olean_dir, "ilean"), "ilean.trace");
+            let olean_hash = hash_bin_file_cached(
+                &mod_.to_path(&pkg.config.lean_lib_dir, "olean"),
+                "olean.trace",
+            );
+            let ilean_hash = hash_bin_file_cached(
+                &mod_.to_path(&pkg.config.lean_lib_dir, "ilean"),
+                "ilean.trace",
+            );
             mix_hash(mix_hash(olean_hash, ilean_hash), dep_trace)
         });
 
@@ -805,91 +811,210 @@ fn cache_dir_from_env() -> PathBuf {
     }
 }
 
-fn get_files_to_unpack(
-    ws: &WorkspaceManifest,
+fn get_files_to_unpack<'a>(
+    ws: &'a WorkspaceManifest,
     invalidate_all: bool,
     targets: impl IntoIterator<Item = Name>,
-) -> Vec<(Name, &PackageConfig, u64)> {
-    let mut hasher = Hasher::new(ws, invalidate_all);
+    f: impl FnMut(Name, &'a PackageConfig, u64),
+) {
+    let mut hasher = Hasher::new(ws, invalidate_all, f);
     for target in targets {
         if let Some((pkg, lib)) = ws.find_module(&target) {
             hasher.get_file_hash(&target, pkg, lib);
         }
     }
-    hasher.to_unpack
+}
+#[derive(Hash, PartialEq, Eq)]
+enum CurlError {
+    Curl(u32, Option<String>),
+    Status(u32),
+}
+
+impl CurlError {
+    fn report(&self, mod_: &Name) {
+        match self {
+            CurlError::Curl(code, extra) => {
+                let mut e = curl::Error::new(*code);
+                if let Some(extra) = extra {
+                    e.set_extra(extra.clone());
+                }
+                eprintln!("{mod_:?} failed:\n{e}");
+            }
+            CurlError::Status(code) => {
+                eprintln!("{mod_:?} failed: HTTP status {code}")
+            }
+        }
+    }
+}
+struct MultiQueue<H, S> {
+    multi: Option<Multi>,
+    handles: Vec<Option<Easy2Handle<H>>>,
+    active: u32,
+    status: S,
+}
+
+trait ProcessMsg<H> {
+    fn process(&mut self, _easy: Easy2<H>, _result: Result<(), curl::Error>) {}
+}
+
+impl<H, S: Default> Default for MultiQueue<H, S> {
+    fn default() -> Self {
+        Self {
+            multi: None,
+            handles: vec![],
+            active: 0,
+            status: S::default(),
+        }
+    }
+}
+
+impl<H, S: ProcessMsg<H>> MultiQueue<H, S> {
+    fn push(&mut self, easy: Easy2<H>) {
+        let multi = self.multi.get_or_insert_with(|| {
+            let mut multi = Multi::new();
+            multi.set_max_total_connections(50).unwrap();
+            multi
+        });
+        let mut easy = multi.add2(easy).unwrap();
+        easy.set_token(self.handles.len()).unwrap();
+        self.handles.push(Some(easy));
+        self.active += 1;
+        self.perform();
+    }
+
+    fn perform(&mut self) -> bool {
+        if self.active > 0 {
+            let multi = self.multi.as_ref().unwrap();
+            self.active = multi.perform().unwrap();
+            multi.messages(|msg| {
+                if let Some(result) = msg.result() {
+                    if let Some(handle) = self.handles[msg.token().unwrap()].take() {
+                        let easy = multi.remove2(handle).unwrap();
+                        self.status.process(easy, result);
+                    }
+                }
+            });
+        }
+        self.active != 0
+    }
+
+    fn wait(&self, d: Duration) {
+        if self.active > 0 {
+            if let Some(multi) = &self.multi {
+                multi.wait(&mut [], d).unwrap();
+            }
+        }
+    }
 }
 
 fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
     let ws = parse_workspace_manifest();
-    let files_to_unpack = get_files_to_unpack(&ws, force_download, targets);
+    let mut files_to_unpack = vec![];
+    let mut multi = MultiQueue::default();
+    let cache_dir = cache_dir_from_env();
+    struct H {
+        mod_: Name,
+        path: PathBuf,
+        file: Option<BufWriter<File>>,
+    }
+    impl curl::easy::Handler for H {
+        fn write(&mut self, data: &[u8]) -> Result<usize, curl::easy::WriteError> {
+            self.file
+                .get_or_insert_with(|| BufWriter::new(File::create(&self.path).unwrap()))
+                .write_all(data)
+                .unwrap();
+            Ok(data.len())
+        }
+    }
+    get_files_to_unpack(&ws, force_download, targets, |mod_, pkg, hash| {
+        let path = ltar_path(&cache_dir, hash);
+        if force_download || !path.exists() {
+            if multi.handles.is_empty() {
+                std::fs::create_dir_all(&cache_dir).unwrap();
+            }
+            let mut easy = curl::easy::Easy2::new(H {
+                mod_: mod_.clone(),
+                path,
+                file: None,
+            });
+            easy.url(&cache_url(hash, None)).unwrap();
+            multi.push(easy);
+        }
+        files_to_unpack.push((mod_, pkg, hash));
+    });
     if files_to_unpack.is_empty() {
         println!("Nothing to do");
         return;
     }
-    let cache_dir = cache_dir_from_env();
-    let files_to_download = files_to_unpack.iter().map(|p| p.2);
-    let files_to_download: Vec<_> = if force_download {
-        files_to_download.collect()
-    } else {
-        files_to_download
-            .filter(|&hash| !ltar_path(&cache_dir, hash).exists())
-            .collect()
-    };
-    if files_to_download.is_empty() {
+    if multi.handles.is_empty() {
         println!("Nothing to download");
     } else {
-        let size = files_to_download.len();
-        std::fs::create_dir_all(&cache_dir).unwrap();
-        println!("Attempting to download {size} file(s)");
-        let curl_cfg_path = cache_dir.join("curl.cfg");
-        {
-            let mut curl_cfg = BufWriter::new(File::create(&curl_cfg_path).unwrap());
-            for hash in files_to_download {
-                writeln!(
-                    curl_cfg,
-                    "url = {}\n-o {:?}",
-                    cache_url(hash, None),
-                    ltar_path(&cache_dir, hash).to_str().expect("bad file path")
-                )
-                .unwrap();
-            }
+        #[derive(Default)]
+        struct S {
+            failed: usize,
+            success: usize,
+            done: usize,
+            failures: HashMap<CurlError, u32>,
+            suppressed: usize,
         }
-        let mut curl = Command::new("curl")
-            .args(["--request", "GET", "--parallel", "--fail", "--silent"])
-            .args(["--write-out", "%{json}\n"])
-            .args(["--config", curl_cfg_path.to_str().expect("bad path")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let (mut success, mut failed, mut done, mut last) = (0, 0, 0, Instant::now());
-        for line in BufReader::new(curl.stdout.take().unwrap()).lines() {
-            #[derive(Debug, Deserialize)]
-            struct CurlResult {
-                http_code: Option<u32>,
-                errormsg: Option<String>,
-                filename_effective: Option<String>,
-            }
-
-            let result: CurlResult = serde_json::from_str(&line.unwrap()).unwrap();
-            match result.http_code {
-                Some(200) => success += 1,
-                Some(404) => {}
-                _ => {
-                    failed += 1;
-                    if let Some(msg) = result.errormsg {
-                        eprintln!("{msg}")
-                    }
-                    if let Some(file_name) = result.filename_effective {
-                        let file = PathBuf::from(file_name);
-                        match std::fs::remove_file(file) {
-                            Err(e) if e.kind() == ErrorKind::NotFound => {}
-                            e => e.unwrap(),
+        impl S {
+            fn report(&mut self, mod_: &Name, err: CurlError) {
+                self.failed += 1;
+                match self.failures.entry(err) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if *e.get() < 3 {
+                            e.key().report(mod_);
+                        } else {
+                            self.suppressed += 1;
                         }
+                        *e.get_mut() += 1;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.key().report(mod_);
+                        e.insert(1);
                     }
                 }
             }
-            done += 1;
+        }
+        impl ProcessMsg<H> for S {
+            fn process(&mut self, mut easy: Easy2<H>, result: Result<(), curl::Error>) {
+                let file = easy.get_mut().file.take();
+                let ok = match result {
+                    Ok(()) => match easy.response_code().unwrap() {
+                        200 => true,
+                        404 => false,
+                        code => {
+                            self.report(&easy.get_mut().mod_, CurlError::Status(code));
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        let msg = easy.take_error_buf();
+                        self.report(&easy.get_mut().mod_, CurlError::Curl(e.code(), msg));
+                        false
+                    }
+                };
+                if !ok && file.is_some() {
+                    drop(file);
+                    let _ = std::fs::remove_file(&easy.get_mut().path);
+                }
+                if ok {
+                    self.success += 1;
+                }
+                self.done += 1;
+            }
+        }
+
+        let size = multi.handles.len();
+        println!("Attempting to download {size} file(s)");
+        let mut last = Instant::now();
+        while multi.perform() {
+            let S {
+                failed,
+                success,
+                done,
+                ..
+            } = multi.status;
             let now = Instant::now();
             if (now - last) >= Duration::from_millis(100) {
                 let percent = 100 * done / size;
@@ -899,10 +1024,20 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
                 }
                 last = now
             }
+            multi.wait(Duration::from_secs(1));
+        }
+        let S {
+            failed,
+            success,
+            done,
+            suppressed,
+            ..
+        } = multi.status;
+        if suppressed > 0 {
+            eprintln!("{suppressed} similar errors were suppressed");
         }
         assert!(size == done, "curl failed before reading all files");
-        drop(curl);
-        std::fs::remove_file(curl_cfg_path).unwrap();
+        drop(multi);
         if done != 0 {
             let percent = 100 * done / size;
             let ok = 100 * success / done;
@@ -938,7 +1073,7 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
                 e => BufReader::new(e.unwrap()),
             };
-            if let Err(e) = leangz::ltar::unpack(&pkg.olean_dir, tarfile, false, false) {
+            if let Err(e) = leangz::ltar::unpack(&pkg.lean_lib_dir, tarfile, false, false) {
                 eprintln!("{mod_:?}: {e}");
                 fail()
             } else {
@@ -1017,81 +1152,107 @@ fn put_cache(overwrite: bool, targets: impl IntoIterator<Item = Name>) {
     let hash = String::from_utf8(hash).unwrap();
     let cache_dir = cache_dir_from_env();
     std::fs::create_dir_all(&cache_dir).unwrap();
-    let commit_file = cache_dir.join(hash.trim_end());
     let ws = parse_workspace_manifest();
-    let files = get_files_to_unpack(&ws, true, targets);
+    let mut files = vec![];
+    get_files_to_unpack(&ws, true, targets, |mod_, pkg, hash| {
+        files.push((mod_, pkg, hash))
+    });
     let send_commit = || {
-        let mut file = BufWriter::new(File::create(&commit_file).unwrap());
+        let mut buffer = vec![];
         for (_, _, hash) in &files {
-            writeln!(file, "{hash:016x}").unwrap()
+            writeln!(buffer, "{hash:016x}").unwrap()
         }
-        drop(file);
-        let mut curl = Command::new("curl");
-        curl.args(["-X", "PUT", "-H", "x-ms-blob-type: BlockBlob"]);
+        let mut easy = curl::easy::Easy::new();
+        easy.url(&format!("{CACHE_URL}/c/{hash}?{token}")).unwrap();
+        easy.put(true).unwrap();
+        let mut list = curl::easy::List::new();
+        list.append("x-ms-blob-type: BlockBlob").unwrap();
         if !overwrite {
-            curl.args(["-H", "If-None-Match: *"]);
+            list.append("If-None-Match: *").unwrap();
         }
-        curl.args(["-T", commit_file.to_str().unwrap()])
-            .arg(format!("{CACHE_URL}/c/{hash}?{token}"))
-            .status()
+        easy.http_headers(list).unwrap();
+        let mut cursor = std::io::Cursor::new(buffer);
+        easy.read_function(move |buf| Ok(cursor.read(buf).unwrap()))
             .unwrap();
-        std::fs::remove_file(commit_file).unwrap();
+        easy.perform().unwrap();
     };
     let send_files = || {
         if files.is_empty() {
             println!("No files to upload");
             return;
         }
+        println!("Attempting to upload {} file(s)", files.len());
+        let (send, recv) = crossbeam_channel::unbounded();
+        let poll = std::thread::spawn(move || {
+            let mut multi = Multi::new();
+            multi.set_max_total_connections(50).unwrap();
+            let mut empty = true;
+            loop {
+                match if empty {
+                    recv.recv().map_err(|_| TryRecvError::Disconnected)
+                } else {
+                    recv.try_recv()
+                } {
+                    Ok(easy) => {
+                        multi.add(easy).unwrap();
+                        empty = false;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        if !empty {
+                            empty = multi.perform().unwrap() == 0;
+                        }
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        while !empty {
+                            empty = multi.perform().unwrap() == 0;
+                        }
+                        return;
+                    }
+                }
+            }
+        });
         (&files).into_par_iter().for_each(|&(ref mod_, pkg, hash)| {
             let tarfile = ltar_path(&cache_dir, hash);
-            if !overwrite && tarfile.exists() {
-                return;
+            if overwrite || !tarfile.exists() {
+                let tarfile = BufWriter::new(File::create(&tarfile).unwrap());
+                let mut paths = vec![
+                    mod_.to_path(&pkg.rel_lean_lib_dir, "olean"),
+                    mod_.to_path(&pkg.rel_lean_lib_dir, "ilean"),
+                    mod_.to_path(&pkg.rel_native_lib_dir, "c"),
+                ];
+                let extra = mod_.to_path(&pkg.rel_lean_lib_dir, "extra");
+                if pkg.build_dir.join(&extra).exists() {
+                    paths.push(extra)
+                }
+                leangz::ltar::pack(
+                    &pkg.build_dir,
+                    tarfile,
+                    mod_.to_path(&pkg.rel_lean_lib_dir, "trace")
+                        .to_str()
+                        .unwrap(),
+                    paths
+                        .into_iter()
+                        .map(|path| path.to_str().unwrap().to_owned()),
+                    false,
+                )
+                .unwrap();
             }
-            let tarfile = BufWriter::new(File::open(tarfile).unwrap());
-            let mut paths = vec![
-                mod_.to_path(&pkg.rel_olean_dir, "olean"),
-                mod_.to_path(&pkg.rel_olean_dir, "ilean"),
-                mod_.to_path(&pkg.rel_ir_dir, "c"),
-            ];
-            let extra = mod_.to_path(&pkg.rel_olean_dir, "extra");
-            if pkg.build_dir.join(&extra).exists() {
-                paths.push(extra)
+            let mut easy = curl::easy::Easy::new();
+            easy.url(&cache_url(hash, Some(&token))).unwrap();
+            easy.put(true).unwrap();
+            let mut list = curl::easy::List::new();
+            list.append("x-ms-blob-type: BlockBlob").unwrap();
+            if !overwrite {
+                list.append("If-None-Match: *").unwrap();
             }
-            leangz::ltar::pack(
-                &pkg.build_dir,
-                tarfile,
-                mod_.to_path(&pkg.rel_olean_dir, "trace").to_str().unwrap(),
-                paths
-                    .into_iter()
-                    .map(|path| path.to_str().unwrap().to_owned()),
-                false,
-            )
-            .unwrap();
+            easy.http_headers(list).unwrap();
+            let mut tarfile = BufReader::new(File::open(tarfile).unwrap());
+            easy.read_function(move |buf| Ok(tarfile.read(buf).unwrap()))
+                .unwrap();
+            let _ = send.send(easy);
         });
-
-        println!("Attempting to upload {} file(s)", files.len());
-        let curl_cfg_path = cache_dir.join("curl.cfg");
-        let mut curl_cfg = BufWriter::new(File::create(&curl_cfg_path).unwrap());
-        for &(_, _, hash) in &files {
-            writeln!(
-                curl_cfg,
-                "-T {:?}\nurl = {}",
-                ltar_path(&cache_dir, hash).to_str().expect("bad file path"),
-                cache_url(hash, Some(&token)),
-            )
-            .unwrap();
-        }
-        drop(curl_cfg);
-        let mut curl = Command::new("curl");
-        curl.args(["-X", "PUT", "-H", "x-ms-blob-type: BlockBlob"]);
-        if !overwrite {
-            curl.args(["-H", "If-None-Match: *"]);
-        }
-        curl.args(["--parallel", "-K"])
-            .arg(curl_cfg_path.to_str().expect("bad path"))
-            .status()
-            .unwrap();
-        std::fs::remove_file(curl_cfg_path).unwrap();
+        drop(send);
+        poll.join().unwrap();
     };
     rayon::join(send_commit, send_files);
 }
@@ -1102,16 +1263,13 @@ fn clean_cache(everything: bool) {
         Err(e) if e.kind() == ErrorKind::NotFound => return,
         e => e.unwrap(),
     };
-    let keep = if everything {
-        HashSet::new()
-    } else {
+    let mut keep = HashSet::new();
+    if !everything {
         let ws = parse_workspace_manifest();
-        let files = get_files_to_unpack(&ws, true, get_targets(std::iter::empty()));
-        files
-            .into_iter()
-            .map(|(_, _, hash)| format!("{hash:016x}"))
-            .collect()
-    };
+        get_files_to_unpack(&ws, true, get_targets(std::iter::empty()), |_, _, hash| {
+            keep.insert(format!("{hash:016x}"));
+        });
+    }
     let mut to_remove = vec![];
     for entry in rd {
         let Ok(entry) = entry else { continue };

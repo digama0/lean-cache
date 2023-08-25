@@ -160,6 +160,7 @@ dependencies = [
 name = "lean-cache"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "curl",
  "leangz",
  "memmap2",
