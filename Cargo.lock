@@ -171,8 +171,8 @@ dependencies = [
 
 [[package]]
 name = "leangz"
-version = "0.1.4"
-source = "git+https://github.com/digama0/leangz.git#41081c228e55c43a52f713aadf3878109991477e"
+version = "0.1.5"
+source = "git+https://github.com/digama0/leangz.git#ecfc10eefe23579fcfb0ba7e6f766ba95bb6c528"
 dependencies = [
  "byteorder",
  "hashbrown",

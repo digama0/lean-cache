@@ -914,13 +914,14 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
     let cache_dir = cache_dir_from_env();
     struct H {
         mod_: Name,
+        temp: PathBuf,
         path: PathBuf,
         file: Option<BufWriter<File>>,
     }
     impl curl::easy::Handler for H {
         fn write(&mut self, data: &[u8]) -> Result<usize, curl::easy::WriteError> {
             self.file
-                .get_or_insert_with(|| BufWriter::new(File::create(&self.path).unwrap()))
+                .get_or_insert_with(|| BufWriter::new(File::create(&self.temp).unwrap()))
                 .write_all(data)
                 .unwrap();
             Ok(data.len())
@@ -932,8 +933,11 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
             if multi.handles.is_empty() {
                 std::fs::create_dir_all(&cache_dir).unwrap();
             }
+            let mut temp = path.clone();
+            temp.set_extension("ltar.part");
             let mut easy = curl::easy::Easy2::new(H {
                 mod_: mod_.clone(),
+                temp,
                 path,
                 file: None,
             });
@@ -994,9 +998,14 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
                         false
                     }
                 };
-                if !ok && file.is_some() {
+                if let Some(file) = file {
                     drop(file);
-                    let _ = std::fs::remove_file(&easy.get_mut().path);
+                    let h = easy.get_mut();
+                    let _ = if ok {
+                        std::fs::rename(&h.temp, &h.path)
+                    } else {
+                        std::fs::remove_file(&h.temp)
+                    };
                 }
                 if ok {
                     self.success += 1;
@@ -1069,12 +1078,27 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
     files_to_unpack
         .into_par_iter()
         .for_each(|(mod_, pkg, hash)| {
-            let tarfile = match File::open(ltar_path(&cache_dir, hash)) {
+            let path = ltar_path(&cache_dir, hash);
+            let tarfile = match File::open(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
                 e => BufReader::new(e.unwrap()),
             };
             if let Err(e) = leangz::ltar::unpack(&pkg.lean_lib_dir, tarfile, false, false) {
-                eprintln!("{mod_:?}: {e}");
+                let is_truncated = match e {
+                    leangz::ltar::UnpackError::IOError(ref e) => {
+                        e.kind() == ErrorKind::UnexpectedEof
+                    }
+                    leangz::ltar::UnpackError::InvalidUtf8(_) => false,
+                    leangz::ltar::UnpackError::BadLtar => true,
+                    leangz::ltar::UnpackError::BadTrace => false,
+                    leangz::ltar::UnpackError::UnsupportedCompression(_) => false,
+                };
+                if is_truncated {
+                    eprintln!("removing corrupted cache file for {mod_:?}");
+                    let _ = std::fs::remove_file(path);
+                } else {
+                    eprintln!("{mod_:?}: {e}");
+                }
                 fail()
             } else {
                 unpacked.fetch_add(1, Ordering::Relaxed);
