@@ -514,16 +514,17 @@ fn hash_bin_file(path: &Path) -> u64 {
     str_hash(&buf)
 }
 
-fn hash_bin_file_cached(path: &Path, new_ext: &str) -> u64 {
+fn hash_bin_file_cached(path: &Path, new_ext: &str, invalidate: bool) -> u64 {
     let mut trace = path.to_owned();
     trace.set_extension(new_ext);
-    if let Ok(trace) = std::fs::read_to_string(&trace) {
-        trace.parse::<u64>().unwrap()
-    } else {
-        let hash = hash_bin_file(path);
-        let _ = std::fs::write(trace, format!("{hash}"));
-        hash
+    if !invalidate {
+        if let Ok(trace) = std::fs::read_to_string(&trace) {
+            return trace.parse::<u64>().unwrap();
+        }
     }
+    let hash = hash_bin_file(path);
+    let _ = std::fs::write(trace, format!("{hash}"));
+    hash
 }
 
 fn check_trace_file(path: &Path, expected: u64) -> bool {
@@ -684,7 +685,7 @@ fn hash_as_lean(name: &Name) -> u64 {
     mix_hash(inner(p), str_hash(format!("{last}.lean").as_bytes()))
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum Trace {
     Unknown,
     Ok(u64),
@@ -722,11 +723,11 @@ impl Trace {
         }
     }
 
-    fn and_then(self, then: impl FnOnce() -> Trace) -> Trace {
-        if let Trace::Unknown = self {
-            self
-        } else {
-            then()
+    fn and_then(self, then: impl FnOnce(u64, bool) -> Trace) -> Trace {
+        match self {
+            Trace::Unknown => self,
+            Trace::Ok(a) => then(a, false),
+            Trace::Changed(a) => then(a, true),
         }
     }
 }
@@ -792,7 +793,10 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64, Option<u64>)> Hasher<'a, F> {
                 if !path.exists() {
                     return None;
                 }
-                trace = mix_hash(trace, hash_bin_file_cached(&path, "gz.hash"));
+                trace = mix_hash(
+                    trace,
+                    hash_bin_file_cached(&path, "gz.hash", self.invalidate_all),
+                );
             }
             Some(trace)
         })();
@@ -852,19 +856,21 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64, Option<u64>)> Hasher<'a, F> {
                 }
             }
         }
-        let dep_trace = import_trace.and_then(|| {
+        let dep_trace = import_trace.and_then(|_, _| {
             let extra_dep_trace = Trace::from(self.lib_extra_dep_targets(pkg, lib));
             let mod_trace = NIL_HASH; // since we aren't tracking precompileImports
             let extern_trace = NIL_HASH;
             extra_dep_trace.mix(import_trace.mix(mix_hash(mod_trace, extern_trace)))
         });
-        let mod_trace = dep_trace.change(|dep_trace| {
+        let mod_trace = dep_trace.and_then(|dep_trace, ch| {
             let arg_trace = lib.lean_args_trace();
             let mod_trace = mix_hash(
                 self.lean_trace,
                 mix_hash(arg_trace, mix_hash(mix_hash(NIL_HASH, src_hash), dep_trace)),
             );
-            check_trace_file(&mod_.to_path(&pkg.config.lean_lib_dir, "trace"), mod_trace)
+            Trace::Ok(mod_trace).change(|_| ch).change(|mod_trace| {
+                check_trace_file(&mod_.to_path(&pkg.config.lean_lib_dir, "trace"), mod_trace)
+            })
         });
         match mod_trace {
             Trace::Ok(_) if !self.invalidate_all => {}
@@ -873,14 +879,16 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64, Option<u64>)> Hasher<'a, F> {
                 (self.unpack)(mod_.clone(), &pkg.config, hash, Some(a))
             }
         }
-        let trace = dep_trace.and_then(|| {
+        let trace = dep_trace.and_then(|_, _| {
             let olean_hash = hash_bin_file_cached(
                 &mod_.to_path(&pkg.config.lean_lib_dir, "olean"),
                 "olean.trace",
+                self.invalidate_all,
             );
             let ilean_hash = hash_bin_file_cached(
                 &mod_.to_path(&pkg.config.lean_lib_dir, "ilean"),
                 "ilean.trace",
+                self.invalidate_all,
             );
             Trace::Ok(mix_hash(olean_hash, ilean_hash)).mix(dep_trace)
         });
