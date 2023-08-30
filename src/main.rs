@@ -1,3 +1,5 @@
+mod lean;
+
 use crossbeam_channel::TryRecvError;
 use curl::easy::Easy2;
 use curl::multi::{Easy2Handle, Multi};
@@ -11,7 +13,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::str::Chars;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,7 +75,7 @@ impl Name {
 
     fn from_str(s: &str) -> Name {
         let mut ch = s.chars();
-        let n = parse_name(&mut ch);
+        let n = lean::parse_name(&mut ch);
         assert!(ch.next().is_none());
         n
     }
@@ -155,131 +156,6 @@ impl From<&str> for Name {
     fn from(value: &str) -> Self {
         Self::str(Self::Anon, value.into())
     }
-}
-
-fn is_letter_like(c: char) -> bool {
-    let c = c as u32;
-    ((0x3b1..=0x3c9).contains(&c) && c != 0x3bb)                       // Lower greek, but lambda
-        || ((0x391..=0x3A9).contains(&c) && c != 0x3A0 && c != 0x3A3)  // Upper greek, but Pi and Sigma
-        || (0x3ca..=0x3fb).contains(&c)                                // Coptic letters
-        || (0x1f00..=0x1ffe).contains(&c)                              // Polytonic Greek Extended Character Set
-        || (0x2100..=0x214f).contains(&c)                              // Letter like block
-        || (0x1d49c..=0x1d59f).contains(&c) // Latin letters, Script, Double-struck, Fractur
-}
-
-fn is_subscript_alphanumeric(c: char) -> bool {
-    let c = c as u32;
-    (0x2080..=0x2089).contains(&c)
-        || (0x2090..=0x209c).contains(&c)
-        || (0x1d62..=0x1d6a).contains(&c)
-}
-fn is_id_first(c: char) -> bool {
-    c.is_alphabetic() || c == '_' || is_letter_like(c)
-}
-fn is_id_rest(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || !matches!(c, '.' | '\n' | ' ')
-            && (matches!(c, '_' | '\'' | '!' | '?')
-                || is_letter_like(c)
-                || is_subscript_alphanumeric(c))
-}
-
-fn parse_name(it: &mut Chars<'_>) -> Name {
-    let mut p = Name::Anon;
-    loop {
-        let orig = it.as_str();
-        let c = it.next().unwrap_or_else(|| panic!("expected identifier"));
-        if c == '«' {
-            let s = it.as_str();
-            let (i, _) = (s.char_indices())
-                .find(|&(_, c)| c == '»')
-                .unwrap_or_else(|| panic!("unterminated identifier escape"));
-            let (ident, s) = s.split_at(i);
-            p = Name::str(p, ident.into());
-            *it = s.chars();
-            it.next();
-        } else {
-            assert!(is_id_first(c), "expected identifier");
-            let i = (orig.char_indices())
-                .find(|&(_, c)| !is_id_rest(c))
-                .map_or(orig.len(), |(i, _)| i);
-            let (ident, s) = orig.split_at(i);
-            p = Name::str(p, ident.into());
-            *it = s.chars();
-        }
-        let is_id_cont = {
-            let mut it2 = it.clone();
-            it2.next() == Some('.') && matches!(it2.next(), Some(c) if is_id_first(c) || c == '«')
-        };
-        if !is_id_cont {
-            break;
-        }
-        it.next();
-    }
-    p
-}
-
-fn parse_imports(s: &str) -> Vec<(Name, bool)> {
-    fn ws(it: &mut Chars<'_>) {
-        let mut orig = it.as_str();
-        while let Some(c) = it.next() {
-            match c {
-                '\t' => panic!("tabs are not allowed"),
-                ' ' | '\r' | '\n' => {}
-                '-' if it.clone().next() == Some('-') => {
-                    it.find(|&c| c == '\n');
-                }
-                '/' if {
-                    let mut chars = it.clone();
-                    chars.next() == Some('-') && !matches!(chars.next(), Some('!' | '-'))
-                } =>
-                {
-                    let mut nesting = 1;
-                    loop {
-                        match it.next().unwrap_or_else(|| panic!("unterminated comment")) {
-                            '-' if it.clone().next() == Some('/') => {
-                                it.next();
-                                if nesting == 1 {
-                                    break;
-                                }
-                                nesting -= 1;
-                            }
-                            '/' if it.clone().next() == Some('-') => {
-                                it.next();
-                                nesting += 1;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {
-                    *it = orig.chars();
-                    break;
-                }
-            }
-            orig = it.as_str();
-        }
-    }
-
-    fn keyword(it: &mut Chars<'_>, k: &str) -> Option<()> {
-        *it = it.as_str().strip_prefix(k)?.chars();
-        ws(it);
-        Some(())
-    }
-
-    let mut it = s.chars();
-    let mut imports = vec![];
-    ws(&mut it);
-    if keyword(&mut it, "prelude").is_none() {
-        imports.push(("Init".into(), false))
-    }
-    while keyword(&mut it, "import").is_some() {
-        let rt = keyword(&mut it, "runtime").is_some();
-        let p = parse_name(&mut it);
-        ws(&mut it);
-        imports.push((p, rt))
-    }
-    imports
 }
 
 // fn parse_lake_manifest() -> HashMap<String, PathBuf> {
@@ -536,14 +412,16 @@ fn check_trace_file(path: &Path, expected: u64) -> bool {
 }
 
 fn parse_workspace_manifest() -> WorkspaceManifest {
-    assert!(
-        check_trace_file(
-            "build/workspace-manifest.trace".as_ref(),
-            mix_hash(NIL_HASH, hash_text_file("lakefile.lean".as_ref()))
-        ),
-        "workspace-manifest hash does not match, run 'lake-ext'"
-    );
-
+    let lakefile = std::fs::read_to_string("lakefile.lean").unwrap();
+    if !check_trace_file(
+        "build/workspace-manifest.trace".as_ref(),
+        mix_hash(NIL_HASH, hash_text(&lakefile)),
+    ) {
+        if let Some(ws) = lean::try_parse_lakefile(&lakefile) {
+            return ws;
+        }
+        panic!("workspace-manifest hash does not match, run 'lake-ext'")
+    }
     let mut bytes = Vec::new();
     File::open("build/workspace-manifest.json")
         .unwrap()
@@ -843,7 +721,7 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64, Option<u64>)> Hasher<'a, F> {
             import_trace = Trace::Unknown; // don't attempt to track transImports etc
         }
         let mut seen = HashSet::new();
-        let imports = parse_imports(&contents);
+        let imports = lean::parse_imports(&contents);
         for (import, _) in &imports {
             if let Some((pkg, lib)) = self.ws.find_module(import) {
                 let (Some(import_hash), import1_trace) = self.get_file_hash(import, pkg, lib) else {
