@@ -53,3 +53,5 @@ def main : IO Unit := do
   IO.FS.writeFile traceFile trace.toString
   let jsonFile := ws.root.buildDir / "workspace-manifest.json"
   IO.FS.writeFile jsonFile <| toString <| toJson (← ws.toManifest)
+  if ws.root.config.buildDir != defaultBuildDir then
+    throw <| .userError "non-default build directory not supported"

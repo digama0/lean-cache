@@ -352,10 +352,10 @@ struct PackageConfig {
     // workspace: WorkspaceConfig,
     #[serde(flatten)]
     lean: LeanConfig,
-    name: String,
+    name: Name,
     // manifest_file: String,
-    // extra_dep_targets: Vec<Name>,
-    // precompile_modules: bool,
+    extra_dep_targets: Vec<Name>,
+    precompile_modules: bool,
     // more_server_args: Vec<String>,
     src_dir: PathBuf,
     build_dir: PathBuf,
@@ -370,8 +370,8 @@ struct PackageConfig {
     // bin_dir: PathBuf,
     // ir_dir: PathBuf,
     // release_repo: Option<String>,
-    // build_archive: Option<String>,
-    // prefer_release_build: bool,
+    build_archive: Option<String>,
+    prefer_release_build: bool,
     #[serde(skip)]
     lean_args_trace: u64,
 }
@@ -389,13 +389,13 @@ struct PackageConfig {
 //     },
 // }
 
-// #[derive(Debug, Deserialize)]
-// #[serde(rename_all = "camelCase")]
-// struct Dependency {
-//     name: Name,
-//     src: Source,
-//     options: BTreeMap<String, String>,
-// }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Dependency {
+    name: Name,
+    // src: Source,
+    // options: BTreeMap<String, String>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -415,7 +415,7 @@ struct LeanLibConfig {
     roots: Vec<Name>,
     globs: Vec<Glob>,
     // lib_name: String,
-    // extra_dep_targets: Vec<Name>,
+    extra_dep_targets: Vec<Name>,
     precompile_modules: bool,
     // default_facets: Vec<String>,
     // native_facets: Vec<String>,
@@ -432,7 +432,7 @@ struct LeanExeConfig {
     src_dir: PathBuf,
     root: Name,
     // exe_name: String,
-    // extra_dep_targets: Vec<Name>,
+    extra_dep_targets: Vec<Name>,
     // support_interpreter: bool,
     #[serde(skip)]
     lean_args_trace: u64,
@@ -445,7 +445,7 @@ struct PackageManifest {
     config: PackageConfig,
     // remote_url: Option<String>,
     // git_tag: Option<String>,
-    // deps: Vec<Dependency>,
+    deps: Vec<Dependency>,
     lean_lib_configs: BTreeMap<String, LeanLibConfig>,
     lean_exe_configs: BTreeMap<String, LeanExeConfig>,
 }
@@ -489,9 +489,15 @@ struct LakeEnv {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceManifest {
-    // root: String,
+    root: Name,
     packages: Vec<PackageManifest>,
     lake_env: LakeEnv,
+}
+
+impl WorkspaceManifest {
+    fn package(&self, name: &Name) -> Option<&PackageManifest> {
+        self.packages.iter().find(|p| p.config.name == *name)
+    }
 }
 
 fn hash_text(s: &str) -> u64 {
@@ -520,7 +526,7 @@ fn hash_bin_file_cached(path: &Path, new_ext: &str) -> u64 {
     }
 }
 
-fn read_trace_file(path: &Path, expected: u64) -> bool {
+fn check_trace_file(path: &Path, expected: u64) -> bool {
     if let Ok(trace) = std::fs::read_to_string(path) {
         expected == trace.parse::<u64>().unwrap()
     } else {
@@ -530,7 +536,7 @@ fn read_trace_file(path: &Path, expected: u64) -> bool {
 
 fn parse_workspace_manifest() -> WorkspaceManifest {
     assert!(
-        read_trace_file(
+        check_trace_file(
             "build/workspace-manifest.trace".as_ref(),
             mix_hash(NIL_HASH, hash_text_file("lakefile.lean".as_ref()))
         ),
@@ -597,6 +603,7 @@ impl LeanLibConfig {
     }
 }
 
+#[derive(Copy, Clone)]
 enum LibRef<'a> {
     Lib(&'a LeanLibConfig),
     Exe(&'a LeanExeConfig),
@@ -606,6 +613,13 @@ impl LibRef<'_> {
         match *self {
             LibRef::Lib(lib) => lib.precompile_modules,
             LibRef::Exe(_) => false,
+        }
+    }
+
+    fn extra_dep_targets(&self) -> &[Name] {
+        match *self {
+            LibRef::Lib(lib) => &lib.extra_dep_targets,
+            LibRef::Exe(exe) => &exe.extra_dep_targets,
         }
     }
 
@@ -676,12 +690,13 @@ struct Hasher<'a, F> {
     lean_trace: u64,
     invalidate_all: bool,
     cache: HashMap<Name, (Option<u64>, Option<u64>)>,
+    extra_dep_targets: HashMap<Name, Option<u64>>,
     unpack: F,
 }
 
 impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
     fn new(ws: &'a WorkspaceManifest, invalidate_all: bool, unpack: F) -> Self {
-        let mathlib_name = "mathlib";
+        let mathlib_name = Name::from_str("mathlib");
         let mathlib = (ws.packages.iter())
             .find(|pkg| pkg.config.name == mathlib_name)
             .unwrap_or_else(|| panic!("not in mathlib or a project that depends on mathlib"));
@@ -696,7 +711,54 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
             invalidate_all,
             cache: HashMap::new(),
             unpack,
+            extra_dep_targets: HashMap::new(),
         }
+    }
+
+    fn pkg_extra_dep_targets(&mut self, pkg: &'a PackageManifest) -> Option<u64> {
+        if let Some(&result) = self.extra_dep_targets.get(&pkg.config.name) {
+            return result;
+        }
+        let trace = (|| -> Option<u64> {
+            if !pkg.config.extra_dep_targets.is_empty() {
+                return None;
+            }
+            let mut trace = NIL_HASH;
+            for dep in &pkg.deps {
+                let pkg = self.ws.package(&dep.name).unwrap();
+                trace = mix_hash(trace, self.pkg_extra_dep_targets(pkg)?)
+            }
+            if pkg.config.name != self.ws.root && pkg.config.prefer_release_build {
+                const OS: &str = if cfg!(windows) {
+                    "windows"
+                } else if cfg!(darwin) {
+                    "macOS"
+                } else {
+                    "linux"
+                };
+                const PTR_WIDTH: usize = 8 * std::mem::size_of::<usize>();
+                let archive = match &pkg.config.build_archive {
+                    Some(name) => format!("{name}-{OS}-{PTR_WIDTH}.tar.gz"),
+                    None => format!("{OS}-{PTR_WIDTH}.tar.gz"),
+                };
+                let path = pkg.config.build_dir.join(archive);
+                if !path.exists() {
+                    return None;
+                }
+                trace = mix_hash(trace, hash_bin_file_cached(&path, "gz.hash"));
+            }
+            Some(trace)
+        })();
+        self.extra_dep_targets
+            .insert(pkg.config.name.clone(), trace);
+        trace
+    }
+
+    fn lib_extra_dep_targets(&mut self, pkg: &'a PackageManifest, lib: LibRef<'_>) -> Option<u64> {
+        if !lib.extra_dep_targets().is_empty() {
+            return None;
+        }
+        self.pkg_extra_dep_targets(pkg)
     }
 
     fn get_file_hash(
@@ -726,7 +788,7 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
         let src_hash = hash_text(&contents);
         hash = mix_hash(hash, src_hash);
         let mut trace = Some(NIL_HASH);
-        if self.invalidate_all || lib.precompile_modules() {
+        if self.invalidate_all || pkg.config.precompile_modules || lib.precompile_modules() {
             trace = None; // don't attempt to track transImports etc
         }
         let mut seen = HashSet::new();
@@ -744,16 +806,20 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
             }
         }
         trace = trace.and_then(|import_trace| {
+            let extra_dep_trace = self.lib_extra_dep_targets(pkg, lib)?;
             let mod_trace = NIL_HASH; // since we aren't tracking precompileImports
             let extern_trace = NIL_HASH;
-            let dep_trace = mix_hash(import_trace, mix_hash(mod_trace, extern_trace));
+            let dep_trace = mix_hash(
+                extra_dep_trace,
+                mix_hash(import_trace, mix_hash(mod_trace, extern_trace)),
+            );
             let arg_trace = lib.lean_args_trace();
             let mod_trace = mix_hash(
                 self.lean_trace,
                 mix_hash(arg_trace, mix_hash(mix_hash(NIL_HASH, src_hash), dep_trace)),
             );
             let trace =
-                read_trace_file(&mod_.to_path(&pkg.config.lean_lib_dir, "trace"), mod_trace);
+                check_trace_file(&mod_.to_path(&pkg.config.lean_lib_dir, "trace"), mod_trace);
             trace.then_some(dep_trace)
         });
         if trace.is_none() {
