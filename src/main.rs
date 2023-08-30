@@ -684,17 +684,64 @@ fn hash_as_lean(name: &Name) -> u64 {
     mix_hash(inner(p), str_hash(format!("{last}.lean").as_bytes()))
 }
 
+#[derive(Copy, Clone)]
+enum Trace {
+    Unknown,
+    Ok(u64),
+    Changed(u64),
+}
+
+impl From<u64> for Trace {
+    fn from(v: u64) -> Self {
+        Self::Ok(v)
+    }
+}
+impl From<Option<u64>> for Trace {
+    fn from(v: Option<u64>) -> Self {
+        match v {
+            Some(trace) => Self::Ok(trace),
+            None => Self::Unknown,
+        }
+    }
+}
+impl Trace {
+    fn mix(self, other: impl Into<Self>) -> Self {
+        match (self, other.into()) {
+            (Trace::Unknown, _) | (_, Trace::Unknown) => Trace::Unknown,
+            (Trace::Ok(a), Trace::Ok(b)) => Trace::Ok(mix_hash(a, b)),
+            (Trace::Changed(a), Trace::Ok(b))
+            | (Trace::Ok(a), Trace::Changed(b))
+            | (Trace::Changed(a), Trace::Changed(b)) => Trace::Changed(mix_hash(a, b)),
+        }
+    }
+
+    fn change(self, ch: impl FnOnce(u64) -> bool) -> Self {
+        match self {
+            Trace::Ok(a) if ch(a) => Trace::Changed(a),
+            _ => self,
+        }
+    }
+
+    fn and_then(self, then: impl FnOnce() -> Trace) -> Trace {
+        if let Trace::Unknown = self {
+            self
+        } else {
+            then()
+        }
+    }
+}
+
 struct Hasher<'a, F> {
     ws: &'a WorkspaceManifest,
     root_hash: u64,
     lean_trace: u64,
     invalidate_all: bool,
-    cache: HashMap<Name, (Option<u64>, Option<u64>)>,
+    cache: HashMap<Name, (Option<u64>, Trace)>,
     extra_dep_targets: HashMap<Name, Option<u64>>,
     unpack: F,
 }
 
-impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
+impl<'a, F: FnMut(Name, &'a PackageConfig, u64, Option<u64>)> Hasher<'a, F> {
     fn new(ws: &'a WorkspaceManifest, invalidate_all: bool, unpack: F) -> Self {
         let mathlib_name = Name::from_str("mathlib");
         let mathlib = (ws.packages.iter())
@@ -766,7 +813,7 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
         mod_: &Name,
         pkg: &'a PackageManifest,
         lib: LibRef<'_>,
-    ) -> (Option<u64>, Option<u64>) {
+    ) -> (Option<u64>, Trace) {
         if let Some(&result) = self.cache.get(mod_) {
             return result;
         }
@@ -777,8 +824,8 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
                     "warning: {} not found. skipping files that depend on it",
                     path.display()
                 );
-                self.cache.insert(mod_.clone(), (None, None));
-                return (None, None);
+                self.cache.insert(mod_.clone(), (None, Trace::Unknown));
+                return (None, Trace::Unknown);
             }
             e => e.unwrap(),
         };
@@ -787,45 +834,46 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
         hash = mix_hash(hash, hash_as_lean(mod_));
         let src_hash = hash_text(&contents);
         hash = mix_hash(hash, src_hash);
-        let mut trace = Some(NIL_HASH);
-        if self.invalidate_all || pkg.config.precompile_modules || lib.precompile_modules() {
-            trace = None; // don't attempt to track transImports etc
+        let mut import_trace = Trace::Ok(NIL_HASH);
+        if pkg.config.precompile_modules || lib.precompile_modules() {
+            import_trace = Trace::Unknown; // don't attempt to track transImports etc
         }
         let mut seen = HashSet::new();
         let imports = parse_imports(&contents);
         for (import, _) in &imports {
             if let Some((pkg, lib)) = self.ws.find_module(import) {
-                let (Some(import_hash), import_trace) = self.get_file_hash(import, pkg, lib) else {
-                    self.cache.insert(mod_.clone(), (None, None));
-                    return (None, None);
+                let (Some(import_hash), import1_trace) = self.get_file_hash(import, pkg, lib) else {
+                    self.cache.insert(mod_.clone(), (None, Trace::Unknown));
+                    return (None, Trace::Unknown);
                 };
                 hash = mix_hash(hash, import_hash);
                 if seen.insert(import) {
-                    trace = trace.and_then(|tr| Some(mix_hash(tr, import_trace?)));
+                    import_trace = import_trace.mix(import1_trace);
                 }
             }
         }
-        trace = trace.and_then(|import_trace| {
-            let extra_dep_trace = self.lib_extra_dep_targets(pkg, lib)?;
+        let dep_trace = import_trace.and_then(|| {
+            let extra_dep_trace = Trace::from(self.lib_extra_dep_targets(pkg, lib));
             let mod_trace = NIL_HASH; // since we aren't tracking precompileImports
             let extern_trace = NIL_HASH;
-            let dep_trace = mix_hash(
-                extra_dep_trace,
-                mix_hash(import_trace, mix_hash(mod_trace, extern_trace)),
-            );
+            extra_dep_trace.mix(import_trace.mix(mix_hash(mod_trace, extern_trace)))
+        });
+        let mod_trace = dep_trace.change(|dep_trace| {
             let arg_trace = lib.lean_args_trace();
             let mod_trace = mix_hash(
                 self.lean_trace,
                 mix_hash(arg_trace, mix_hash(mix_hash(NIL_HASH, src_hash), dep_trace)),
             );
-            let trace =
-                check_trace_file(&mod_.to_path(&pkg.config.lean_lib_dir, "trace"), mod_trace);
-            trace.then_some(dep_trace)
+            check_trace_file(&mod_.to_path(&pkg.config.lean_lib_dir, "trace"), mod_trace)
         });
-        if trace.is_none() {
-            (self.unpack)(mod_.clone(), &pkg.config, hash)
+        match mod_trace {
+            Trace::Ok(_) if !self.invalidate_all => {}
+            Trace::Unknown => (self.unpack)(mod_.clone(), &pkg.config, hash, None),
+            Trace::Ok(a) | Trace::Changed(a) => {
+                (self.unpack)(mod_.clone(), &pkg.config, hash, Some(a))
+            }
         }
-        trace = trace.map(|dep_trace| {
+        let trace = dep_trace.and_then(|| {
             let olean_hash = hash_bin_file_cached(
                 &mod_.to_path(&pkg.config.lean_lib_dir, "olean"),
                 "olean.trace",
@@ -834,7 +882,7 @@ impl<'a, F: FnMut(Name, &'a PackageConfig, u64)> Hasher<'a, F> {
                 &mod_.to_path(&pkg.config.lean_lib_dir, "ilean"),
                 "ilean.trace",
             );
-            mix_hash(mix_hash(olean_hash, ilean_hash), dep_trace)
+            Trace::Ok(mix_hash(olean_hash, ilean_hash)).mix(dep_trace)
         });
 
         self.cache.insert(mod_.clone(), (Some(hash), trace));
@@ -881,7 +929,7 @@ fn get_files_to_unpack<'a>(
     ws: &'a WorkspaceManifest,
     invalidate_all: bool,
     targets: impl IntoIterator<Item = Name>,
-    f: impl FnMut(Name, &'a PackageConfig, u64),
+    f: impl FnMut(Name, &'a PackageConfig, u64, Option<u64>),
 ) {
     let mut hasher = Hasher::new(ws, invalidate_all, f);
     for target in targets {
@@ -993,7 +1041,7 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
             Ok(data.len())
         }
     }
-    get_files_to_unpack(&ws, force_download, targets, |mod_, pkg, hash| {
+    get_files_to_unpack(&ws, force_download, targets, |mod_, pkg, hash, trace| {
         let path = ltar_path(&cache_dir, hash);
         if force_download || !path.exists() {
             if multi.handles.is_empty() {
@@ -1010,7 +1058,7 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
             easy.url(&cache_url(hash, None)).unwrap();
             multi.push(easy);
         }
-        files_to_unpack.push((mod_, pkg, hash));
+        files_to_unpack.push((mod_, pkg, hash, trace));
     });
     if files_to_unpack.is_empty() {
         println!("Nothing to do");
@@ -1140,34 +1188,46 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
 
     let mut error = AtomicBool::new(false);
     let mut unpacked = AtomicUsize::new(0);
+    let mut unknown_unpack = AtomicUsize::new(0);
+    let mut bad_unpack = AtomicUsize::new(0);
     let fail = || error.store(true, Ordering::Relaxed);
     files_to_unpack
         .into_par_iter()
-        .for_each(|(mod_, pkg, hash)| {
+        .for_each(|(mod_, pkg, hash, trace)| {
             let path = ltar_path(&cache_dir, hash);
             let tarfile = match File::open(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
                 e => BufReader::new(e.unwrap()),
             };
-            if let Err(e) = leangz::ltar::unpack(&pkg.lean_lib_dir, tarfile, false, false) {
-                let is_truncated = match e {
-                    leangz::ltar::UnpackError::IOError(ref e) => {
-                        e.kind() == ErrorKind::UnexpectedEof
+            match leangz::ltar::unpack(&pkg.lean_lib_dir, tarfile, false, false) {
+                Err(e) => {
+                    let is_truncated = match e {
+                        leangz::ltar::UnpackError::IOError(ref e) => {
+                            e.kind() == ErrorKind::UnexpectedEof
+                        }
+                        leangz::ltar::UnpackError::InvalidUtf8(_) => false,
+                        leangz::ltar::UnpackError::BadLtar => true,
+                        leangz::ltar::UnpackError::BadTrace => false,
+                        leangz::ltar::UnpackError::UnsupportedCompression(_) => false,
+                    };
+                    if is_truncated {
+                        eprintln!("removing corrupted cache file for {mod_:?}");
+                        let _ = std::fs::remove_file(path);
+                    } else {
+                        eprintln!("{mod_:?}: {e}");
                     }
-                    leangz::ltar::UnpackError::InvalidUtf8(_) => false,
-                    leangz::ltar::UnpackError::BadLtar => true,
-                    leangz::ltar::UnpackError::BadTrace => false,
-                    leangz::ltar::UnpackError::UnsupportedCompression(_) => false,
-                };
-                if is_truncated {
-                    eprintln!("removing corrupted cache file for {mod_:?}");
-                    let _ = std::fs::remove_file(path);
-                } else {
-                    eprintln!("{mod_:?}: {e}");
+                    fail()
                 }
-                fail()
-            } else {
-                unpacked.fetch_add(1, Ordering::Relaxed);
+                Ok(trace2) => {
+                    if let Some(t) = trace {
+                        if t != trace2 {
+                            bad_unpack.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        unknown_unpack.fetch_add(1, Ordering::Relaxed);
+                    }
+                    unpacked.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
     eprintln!("unpacked in {} ms", now.elapsed().as_millis());
@@ -1177,8 +1237,22 @@ fn get_cache(force_download: bool, targets: impl IntoIterator<Item = Name>) {
     let not_unpacked = to_unpack - *unpacked.get_mut();
     if not_unpacked != 0 {
         eprintln!(
-            "{not_unpacked} file(s) did not have cached versions, \
+            "note: {not_unpacked} file(s) did not have cached versions;\n\
             run `lake build` to rebuild these files"
+        )
+    }
+    let bad_unpack = *bad_unpack.get_mut();
+    if bad_unpack != 0 {
+        eprintln!(
+            "warning: {bad_unpack} file(s) were unpacked but the hash does not match;\n\
+            run `lake build` to rebuild these files (and maybe report this)"
+        )
+    }
+    let unknown_unpack = *unknown_unpack.get_mut();
+    if unknown_unpack != 0 {
+        eprintln!(
+            "note: {unknown_unpack} file(s) had hashes which could not be confirmed;\n\
+            `lake build` may be necessary"
         )
     }
     std::process::exit(*error.get_mut() as i32);
@@ -1244,7 +1318,7 @@ fn put_cache(overwrite: bool, targets: impl IntoIterator<Item = Name>) {
     std::fs::create_dir_all(&cache_dir).unwrap();
     let ws = parse_workspace_manifest();
     let mut files = vec![];
-    get_files_to_unpack(&ws, true, targets, |mod_, pkg, hash| {
+    get_files_to_unpack(&ws, true, targets, |mod_, pkg, hash, _| {
         files.push((mod_, pkg, hash))
     });
     let send_commit = || {
@@ -1356,7 +1430,8 @@ fn clean_cache(everything: bool) {
     let mut keep = HashSet::new();
     if !everything {
         let ws = parse_workspace_manifest();
-        get_files_to_unpack(&ws, true, get_targets(std::iter::empty()), |_, _, hash| {
+        let targets = get_targets(std::iter::empty());
+        get_files_to_unpack(&ws, true, targets, |_, _, hash, _| {
             keep.insert(format!("{hash:016x}"));
         });
     }
